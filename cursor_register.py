@@ -1,113 +1,255 @@
 import os
+import re
 import csv
 import copy
+import queue
 import argparse
+import threading
 import concurrent.futures
-import hydra
-from faker import Faker
+from sys import platform
 from datetime import datetime
-from omegaconf import OmegaConf, DictConfig
-from DrissionPage import ChromiumOptions, Chromium
 
-from temp_mails import Tempmail_io, Guerillamail_com
-from helper.cursor_register import CursorRegister
-from helper.email import *
+from faker import Faker
+from DrissionPage import ChromiumOptions, Chromium
+from temp_mails import Tempmail_lol, Guerillamail_com
+
+CURSOR_URL = "https://www.cursor.com/"
+CURSOR_LOGIN_URL = "https://authenticator.cursor.sh"
+CURSOR_SIGN_UP_URL =  "https://authenticator.cursor.sh/sign-up"
+CURSOR_SETTINGS_URL = "https://www.cursor.com/settings"
 
 # Parameters for debugging purpose
 hide_account_info = os.getenv('HIDE_ACCOUNT_INFO', 'false').lower() == 'true'
+enable_register_log = True
 enable_headless = os.getenv('ENABLE_HEADLESS', 'false').lower() == 'true'
 enable_browser_log = os.getenv('ENABLE_BROWSER_LOG', 'true').lower() == 'true' or not enable_headless
 
-def register_cursor_core(register_config, options):
+def cursor_turnstile(tab, retry_times = 5):
+    thread_id = threading.current_thread().ident
 
+    for retry in range(retry_times): # Retry times
+        try:
+            if enable_register_log: print(f"[Register][{thread_id}][{retry}] Passing Turnstile")
+            challenge_shadow_root = tab.ele('@id=cf-turnstile').child().shadow_root
+            challenge_shadow_button = challenge_shadow_root.ele("tag:iframe", timeout=30).ele("tag:body").sr("xpath=//input[@type='checkbox']")
+            if challenge_shadow_button:
+                challenge_shadow_button.click()
+                tab.wait.load_start()
+                break
+        except:
+            pass
+        if retry == retry_times - 1:
+            print("[Register] Timeout when passing turnstile")
+
+def sign_up(options):
+
+    def wait_for_new_email_thread(mail, queue, timeout=300):
+        try:
+            data = mail.wait_for_new_email(delay=1, timeout=timeout)
+            queue.put(copy.deepcopy(data))
+        except Exception as e:
+            queue.put(None)
+
+    # Maybe fail to open the browser
     try:
-        # Maybe fail to open the browser
         browser = Chromium(options)
     except Exception as e:
         print(e)
         return None
+
+    retry_times = 5
+    thread_id = threading.current_thread().ident
     
-    if register_config.email_server.name == "temp_email_server":
-        email_server = eval(register_config.temp_email_server.name)(browser)
-        email_address = email_server.get_email_address()
-    elif register_config.email_server.name == "imap_email_server":
-        imap_server = register_config.imap_email_server.imap_server
-        imap_port = register_config.imap_email_server.imap_port
-        imap_username = register_config.imap_email_server.username
-        imap_password = register_config.imap_email_server.password
-        email_address = register_config.email_server.email_address
-        email_server = Imap(imap_server, imap_port, imap_username, imap_password, email_to = email_address)
+    # Get temp email address
+    mail = Tempmail_lol()
+    #mail = Guerillamail_com()
+    email = mail.email
 
-    register = CursorRegister(browser, email_server)
-    tab_signin, status = register.sign_in(email_address)
-    #tab_signup, status = register.sign_up(email_address)
-    token = register.get_cursor_cookie(tab_signin)
+    # Get password and name by faker
+    fake = Faker()
+    password = fake.password(length=12, special_chars=True, digits=True, upper_case=True, lower_case=True)
+    first_name, last_name = fake.name().split(' ')[0:2]
 
-    if token is not None:
-        user_id = token.split("%3A%3A")[0]
-        delete_low_balance_account = register_config.delete_low_balance_account
-        if register_config.email_server.name == "imap_email_server" and delete_low_balance_account:
-            delete_low_balance_account_threshold = register_config.delete_low_balance_account_threshold
+    email_queue = queue.Queue()
+    email_thread = threading.Thread(target=wait_for_new_email_thread, args=(mail, email_queue, ))
+    email_thread.daemon = True
+    email_thread.start()
 
-            usage = register.get_usage(user_id)
-            balance = usage["gpt-4"]["maxRequestUsage"] - usage["gpt-4"]["numRequests"]
-            if balance < delete_low_balance_account_threshold:
-                register.delete_account()
-                tab_signin, status = register.sign_in(email_address)
-                token = register.get_cursor_cookie(tab_signin)
+    tab = browser.new_tab(CURSOR_SIGN_UP_URL)
+    # Input first name, last name, email
+    for retry in range(retry_times):
+        try:
+            if enable_register_log: print(f"[Register][{thread_id}][{retry}] Input first name, last name, email")
+            tab.refresh()
+            tab.ele("xpath=//input[@name='first_name']").input(first_name, clear=True)
+            tab.ele("xpath=//input[@name='last_name']").input(last_name, clear=True)
+            tab.ele("xpath=//input[@name='email']").input(email, clear=True)
+            tab.ele("@type=submit").click()
+            tab.wait.load_start()
 
-    if status or not enable_browser_log:
-        register.browser.quit(force=True, del_data=True)
+            #if tab.ele("xpath=//input[@name='email']").attr("data-invalid") == "true":
+            #    print(f"[Register][{thread_id}] Email is invalid")
+            #    return None
+            
+            # In password page or data is validated, continue to next page
+            if tab.wait.eles_loaded("xpath=//input[@name='password']", timeout=5):
+                print(f"[Register][{thread_id}] Continue to password page")
+                break
+            # If not in password page, try pass turnstile page
+            elif tab.ele("xpath=//input[@name='email']", timeout=3).attr("data-valid") is not None:
+                if enable_register_log: print(f"[Register][{thread_id}][{retry}] Try pass Turnstile for email page")
+                cursor_turnstile(tab)
 
-    if status and not hide_account_info:
-        print(f"[Register] Cursor Email: {email_address}")
+        except Exception as e:
+            print(f"[Register][{thread_id}] Exception when handlding email page.")
+            print(e)
+        
+        # In password page or data is validated, continue to next page
+        if tab.wait.eles_loaded("xpath=//input[@name='password']"):
+            print(f"[Register][{thread_id}] Continue to password page")
+            break
+
+        # Kill the function since time out 
+        if retry == retry_times - 1:
+            print(f"[Register][{thread_id}] Timeout when inputing email address")
+            if not enable_browser_log: browser.quit(force=True, del_data=True)
+            return None
+    
+    # Input password
+    for retry in range(retry_times):
+        try:
+            if enable_register_log: print(f"[Register][{thread_id}][{retry}] Input password")
+            tab.ele("xpath=//input[@name='password']").input(password, clear=True)
+            tab.ele('@type=submit').click()
+            tab.wait.load_start()
+
+            # In code verification page or data is validated, continue to next page
+            if tab.wait.eles_loaded("xpath=//input[@data-index=0]", timeout=5):
+                print(f"[Register][{thread_id}] Continue to email code page")
+                break
+            # If not in verification code page, try pass turnstile page
+            elif tab.ele("xpath=//input[@name='password']", timeout=3).attr("data-valid") is not None:
+                if enable_register_log: print(f"[Register][{thread_id}][{retry}] Try pass Turnstile for password page")
+                cursor_turnstile(tab)
+
+        except Exception as e:
+            print(f"[Register][{thread_id}] Exception when handling password page.")
+            print(e)
+
+        # In code verification page or data is validated, continue to next page
+        if tab.wait.eles_loaded("xpath=//input[@data-index=0]"):
+            print(f"[Register][{thread_id}] Continue to email code page")
+            break
+
+        # Kill the function since time out 
+        if retry == retry_times - 1:
+            if enable_register_log: print(f"[Register][{thread_id}] Timeout when inputing password")
+            if not enable_browser_log: browser.quit(force=True, del_data=True)
+            return None
+
+    # Get email verification code
+    try:
+        data = email_queue.get(timeout=60)
+        assert data is not None, "Fail to get code from email."
+
+        verify_code = None
+        if "body_text" in data:
+            message_text = data["body_text"]
+            message_text = message_text.strip().replace('\n', '').replace('\r', '').replace('=', '')
+            verify_code = re.search(r'open browser window\.(\d{6})This code expires', message_text).group(1)
+        elif "preview" in data:
+            message_text = data["preview"]
+            verify_code = re.search(r'Your verification code is (\d{6})\. This code expires', message_text).group(1)
+        # Handle HTML format
+        elif "content" in data:
+            message_text = data["content"]
+            message_text = re.sub(r"<[^>]*>", "", message_text)
+            message_text = re.sub(r"&#8202;", "", message_text)
+            message_text = re.sub(r"&nbsp;", "", message_text)
+            message_text = re.sub(r'[\n\r\s]', "", message_text)
+            verify_code = re.search(r'openbrowserwindow\.(\d{6})Thiscodeexpires', message_text).group(1)
+        assert verify_code is not None, "Fail to get code from email."
+
+    except Exception as e:
+        print(f"[Register][{thread_id}] Fail to get code from email.")
+        if not enable_browser_log: browser.quit(force=True, del_data=True)
+        return None
+
+    # Input email verification code
+    for retry in range(retry_times):
+        try:
+            if enable_register_log: print(f"[Register][{thread_id}][{retry}] Input email verification code")
+
+            for idx, digit in enumerate(verify_code, start = 0):
+                tab.ele(f"xpath=//input[@data-index={idx}]").input(digit, clear=True)
+                tab.wait(0.1, 0.3)
+            tab.wait(0.5, 1.5)
+        except Exception as e:
+            print(f"[Register][{thread_id}] Exception when handling email code page.")
+            print(e)
+
+        if tab.url != CURSOR_URL:
+            if enable_register_log: print(f"[Register][{thread_id}][{retry}] Try pass Turnstile for email code page.")
+            cursor_turnstile(tab)
+
+        if tab.wait.url_change(CURSOR_URL, timeout=15):
+            break
+
+        # Kill the function since time out 
+        if retry == retry_times - 1:
+            if enable_register_log: print(f"[Register][{thread_id}] Timeout when inputing email verification code")
+            if not enable_browser_log: browser.quit(force=True, del_data=True)
+            return None
+
+    # Get cookie
+    try:
+        cookies = tab.cookies().as_dict()
+    except e:
+        print(f"[Register][{thread_id}] Fail to get cookie.")
+        if not enable_browser_log: browser.quit(force=True, del_data=True)
+        return None
+
+    token = cookies.get('WorkosCursorSessionToken', None)
+    if enable_register_log:
+        if token is not None:
+            print(f"[Register][{thread_id}] Register Account Successfully.")
+        else:
+            print(f"[Register][{thread_id}] Register Account Failed.")
+
+    if not hide_account_info:
+        print(f"[Register] Cursor Email: {email}")
+        print(f"[Register] Cursor Password: {password}")
         print(f"[Register] Cursor Token: {token}")
 
-    ret = {
-        "username": email_address,
-        "token": token
+    browser.quit(force=True, del_data=True)
+
+    return {
+        'username': email,
+        'password': password,
+        'token': token
     }
 
-    return ret
-
-def register_cursor(register_config):
+def register_cursor(number, max_workers):
 
     options = ChromiumOptions()
     options.auto_port()
-    options.new_env()
     # Use turnstilePatch from https://github.com/TheFalloutOf76/CDP-bug-MouseEvent-.screenX-.screenY-patcher
-    turnstile_patch_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
-    options.add_extension(turnstile_patch_path)
+    options.add_extension("turnstilePatch")
 
-    # If fail to pass the cloudflare in headless mode, try to align the user agent with your real browser
+    if platform == "linux" or platform == "linux2":
+        platformIdentifier = "X11; Linux x86_64"
+    elif platform == "darwin":
+        platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
+    elif platform == "win32":
+        platformIdentifier = "Windows NT 10.0; Win64; x64"
+    options.set_user_agent(f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
     if enable_headless: 
-        from platform import platform
-        if platform == "linux" or platform == "linux2":
-            platformIdentifier = "X11; Linux x86_64"
-        elif platform == "darwin":
-            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
-        elif platform == "win32":
-            platformIdentifier = "Windows NT 10.0; Win64; x64"
-        # Please align version with your Chrome
-        chrome_version = "130.0.0.0"        
-        options.set_user_agent(f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36")
         options.headless()
-
-    number = register_config.number
-    max_workers = register_config.max_workers
-    print(f"[Register] Start to register {number} accounts in {max_workers} threads")
 
     # Run the code using multithreading
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for idx in range(number):
-            register_config_thread = copy.deepcopy(register_config)
-            use_custom_address = register_config.email_server.use_custom_address
-            custom_email_address = register_config.email_server.custom_email_address
-            register_config_thread.email_server.email_address = custom_email_address[idx] if use_custom_address else None
-            options_thread = copy.deepcopy(options)
-            futures.append(executor.submit(register_cursor_core, register_config_thread, options_thread))
+        futures = [executor.submit(sign_up, copy.deepcopy(options)) for _ in range(number)]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result is not None:
@@ -118,57 +260,61 @@ def register_cursor(register_config):
     if len(results) > 0:
         formatted_date = datetime.now().strftime("%Y-%m-%d")
 
+        csv_file = f"./output_{formatted_date}.csv"
+        token_file = f"./token_{formatted_date}.csv"
+
         fieldnames = results[0].keys()
-        # Write username, token into a csv file
-        with open(f"./output_{formatted_date}.csv", 'a', newline='') as file:
+
+        # Write username, password, token into a csv file
+        with open(csv_file, 'a', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writerows(results)
+
         # Only write token to csv file, without header
         tokens = [{'token': row['token']} for row in results]
-        with open( f"./token_{formatted_date}.csv", 'a', newline='') as file:
+        with open(token_file, 'a', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=['token'])
             writer.writerows(tokens)
 
     return results
 
-@hydra.main(config_path="config", config_name="config", version_base=None)
-def main(config: DictConfig):
-    OmegaConf.set_struct(config, False)
-    # Validate the config
-    email_server_name = config.register.email_server.name
-    use_custom_address = config.register.email_server.use_custom_address
-    custom_email_address = config.register.email_server.custom_email_address
-    assert email_server_name in ["temp_email_server", "imap_email_server"], "email_server_name should be either temp_email_server or imap_email_server"
-    assert use_custom_address and email_server_name == "imap_email_server" or not use_custom_address, "use_custom_address should be True only when email_server_name is imap_email_server"
-    if use_custom_address and email_server_name == "imap_email_server":
-        config.register.number = len(custom_email_address)
-        print(f"[Register] Parameter regitser.number is overwritten by the length of custom_email_address: {len(custom_email_address)}")
-    
+if __name__ == "__main__":
 
-    account_infos = register_cursor(config.register)
+    parser = argparse.ArgumentParser(description='Cursor Registor')
+    parser.add_argument('--number', type=int, default=2, help="How many account you want")
+    parser.add_argument('--max_workers', type=int, default=1, help="How many workers in multithreading")
+    
+    # The parameters with name starts with oneapi are used to uploead the cookie token to one-api, new-api, chat-api server.
+    parser.add_argument('--oneapi', action='store_true', help='Enable One-API or not')
+    parser.add_argument('--oneapi_url', type=str, required=False, help='URL link for One-API website')
+    parser.add_argument('--oneapi_token', type=str, required=False, help='Token for One-API website')
+    parser.add_argument('--oneapi_channel_url', type=str, required=False, help='Base url for One-API channel')
+
+    args = parser.parse_args()
+    number = args.number
+    max_workers = args.max_workers
+    use_oneapi = args.oneapi
+    oneapi_url = args.oneapi_url
+    oneapi_token = args.oneapi_token
+    oneapi_channel_url = args.oneapi_channel_url
+
+    print(f"[Register] Start to register {number} accounts in {max_workers} threads")
+    account_infos = register_cursor(number, max_workers)
     tokens = list(set([row['token'] for row in account_infos]))
     print(f"[Register] Register {len(tokens)} accounts successfully")
     
-    if config.oneapi.enabled and len(account_infos) > 0:
+    if use_oneapi and len(account_infos) > 0:
         from tokenManager.oneapi_manager import OneAPIManager
         from tokenManager.cursor import Cursor
-
-        oneapi_url = config.oneapi.url
-        oneapi_token = config.oneapi.token
-        oneapi_channel_url = config.oneapi.channel_url
-
         oneapi = OneAPIManager(oneapi_url, oneapi_token)
+
         # Send request by batch to avoid "Too many SQL variables" error in SQLite.
         # If you use MySQL, better to set the batch_size as len(tokens)
         batch_size = 10
         for idx, i in enumerate(range(0, len(tokens), batch_size), start=1):
             batch = tokens[i:i + batch_size]
-            response = oneapi.add_channel(name = "Cursor",
-                                          base_url = oneapi_channel_url,
-                                          key = '\n'.join(batch),
-                                          models = Cursor.models,
-                                          tags = "Cursor")
+            response = oneapi.add_channel("Cursor",
+                                          oneapi_channel_url,
+                                          '\n'.join(batch),
+                                          Cursor.models)
             print(f'[OneAPI] Add Channel Request For Batch {idx}. Status Code: {response.status_code}, Response Body: {response.json()}')
-
-if __name__ == "__main__":
-    main()
